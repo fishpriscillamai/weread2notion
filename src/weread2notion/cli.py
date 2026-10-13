@@ -5,7 +5,7 @@ import re
 import time
 from notion_client import Client
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
@@ -13,6 +13,7 @@ from retrying import retry
 from .blocks import (
     get_callout,
     get_date,
+    get_file,
     get_heading,
     get_icon,
     get_multi_select,
@@ -49,6 +50,18 @@ NOTION_ID_IN_TEXT_PATTERN = re.compile(
     r"([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
     re.IGNORECASE,
 )
+PROPERTY_ALIASES = {
+    "链接": ("Link", "URL", "Url", "url"),
+    "作者": ("Author", "Authors"),
+    "评分": ("Rating", "Score"),
+    "Cover": ("Cover", "cover"),
+    "分类": ("Category", "Categories", "category", "categories"),
+    "状态": ("Status", "Reading Status", "Read Status", "阅读状态", "status"),
+    "阅读时长": ("ReadingTime", "Reading Time", "Read Time", "Duration"),
+    "阅读进度": ("Progress", "Reading Progress", "Read Progress"),
+    "时间": ("Date", "Finished Date", "Finish Date", "Read Date", "Finished At", "date"),
+}
+SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 
 class ConfigError(Exception):
@@ -269,13 +282,17 @@ def get_review_list(bookId):
 
 def check(bookId):
     """检查是否已经插入过 如果已经插入了就删除"""
-    filter = build_equals_filter("BookId", bookId)
-    response = query_data_source(filter=filter)
-    for result in response["results"]:
+    for result in find_existing_pages(bookId):
         try:
             client.blocks.delete(block_id=result["id"])
         except Exception as e:
             print(f"删除块时出错: {e}")
+
+
+def find_existing_pages(bookId):
+    filter = build_equals_filter("BookId", bookId)
+    response = query_data_source(filter=filter)
+    return response.get("results") or []
 
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
@@ -297,6 +314,7 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         "ISBN": isbn,
         "链接": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
         "作者": author,
+        "Cover": cover,
         "Sort": sort,
         "评分": rating,
     }
@@ -320,13 +338,9 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
             format_time += f"{minutes}分"
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
         raw_properties["阅读时长"] = format_time
-        raw_properties["阅读进度"] = readingProgress
-        if "finishedDate" in read_info:
-            raw_properties["时间"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        raw_properties["阅读进度"] = round(readingProgress * 100, 2)
+        if read_info.get("finishedDate"):
+            raw_properties["时间"] = read_info.get("finishedDate")
 
     properties = build_notion_properties(raw_properties)
     icon = get_icon(cover)
@@ -620,28 +634,92 @@ def load_data_source_schema():
     )
 
 
+def resolve_property_name(name):
+    if name in data_source_property_types:
+        return name
+
+    for alias in PROPERTY_ALIASES.get(name, ()):
+        if alias in data_source_property_types:
+            return alias
+
+    lowered = {prop_name.lower(): prop_name for prop_name in data_source_property_types}
+    for alias in PROPERTY_ALIASES.get(name, ()):
+        matched = lowered.get(alias.lower())
+        if matched:
+            return matched
+    return None
+
+
 def get_property_type(name):
-    return data_source_property_types.get(name)
+    actual_name = resolve_property_name(name)
+    return data_source_property_types.get(actual_name) if actual_name else None
 
 
 def has_any_property(names):
-    return any(name in data_source_property_types for name in names)
+    return any(resolve_property_name(name) for name in names)
+
+
+def get_page_property(page, name):
+    actual_name = resolve_property_name(name)
+    if not actual_name:
+        return None
+    return (page.get("properties") or {}).get(actual_name)
+
+
+def property_has_value(property_value):
+    if not property_value:
+        return False
+    prop_type = property_value.get("type")
+    value = property_value.get(prop_type)
+    if prop_type in {"title", "rich_text", "multi_select", "files", "people", "relation"}:
+        return bool(value)
+    if prop_type in {"select", "status", "date"}:
+        return value is not None
+    if prop_type == "number":
+        return value is not None
+    if prop_type == "url":
+        return bool(value)
+    if prop_type == "checkbox":
+        return True
+    return value is not None
+
+
+def should_sync_book(sort, latest_sort, existing_pages, author, categories):
+    if sort > latest_sort or not existing_pages:
+        return True
+
+    first_page = existing_pages[0]
+    required_properties = ["链接", "Cover", "状态", "阅读时长", "阅读进度"]
+    if author:
+        required_properties.append("作者")
+    if categories:
+        required_properties.append("分类")
+
+    for name in required_properties:
+        if resolve_property_name(name) and not property_has_value(
+            get_page_property(first_page, name)
+        ):
+            print(f"检测到已同步书籍缺少 {resolve_property_name(name)}，将重新同步")
+            return True
+    return False
 
 
 def build_equals_filter(name, value):
+    actual_name = resolve_property_name(name) or name
     prop_type = get_property_type(name)
     if prop_type in {"title", "rich_text", "url", "email", "phone_number"}:
-        return {"property": name, prop_type: {"equals": str(value)}}
+        return {"property": actual_name, prop_type: {"equals": str(value)}}
     if prop_type == "number":
-        return {"property": name, "number": {"equals": to_number(value)}}
+        return {"property": actual_name, "number": {"equals": to_number(value)}}
     if prop_type == "select":
-        return {"property": name, "select": {"equals": str(value)}}
+        return {"property": actual_name, "select": {"equals": str(value)}}
     if prop_type == "status":
-        return {"property": name, "status": {"equals": str(value)}}
+        return {"property": actual_name, "status": {"equals": str(value)}}
     raise Exception(f"Notion 属性 {name} 的类型 {prop_type} 暂不支持用于查询")
 
 
 def build_is_not_empty_filter(name):
+    actual_name = resolve_property_name(name) or name
     prop_type = get_property_type(name)
     if prop_type in {
         "title",
@@ -654,7 +732,7 @@ def build_is_not_empty_filter(name):
         "status",
         "date",
     }:
-        return {"property": name, prop_type: {"is_not_empty": True}}
+        return {"property": actual_name, prop_type: {"is_not_empty": True}}
     raise Exception(f"Notion 属性 {name} 的类型 {prop_type} 暂不支持用于查询")
 
 
@@ -675,6 +753,23 @@ def to_name_list(value):
     return [text] if text else []
 
 
+def normalize_categories(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        categories = []
+        for item in value:
+            if isinstance(item, dict):
+                text = to_text(item.get("title") or item.get("name") or item.get("category"))
+            else:
+                text = to_text(item)
+            if text:
+                categories.append(text)
+        return categories or None
+    text = to_text(value)
+    return [text] if text else None
+
+
 def to_number(value):
     if value is None or value == "":
         return None
@@ -689,7 +784,11 @@ def to_number(value):
 
 def normalize_date_value(value):
     if isinstance(value, (int, float)):
-        return datetime.utcfromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            datetime.fromtimestamp(value, timezone.utc)
+            .astimezone(SHANGHAI_TZ)
+            .strftime("%Y-%m-%dT%H:%M:%S")
+        )
     return value
 
 
@@ -705,7 +804,8 @@ def build_option_property(prop_type, value):
 
 
 def build_notion_property(name, value):
-    prop_type = get_property_type(name)
+    actual_name = resolve_property_name(name)
+    prop_type = data_source_property_types.get(actual_name) if actual_name else None
     if not prop_type:
         if name not in skipped_property_names:
             print(f"属性 {name} 在 Notion 模板中不存在，自动跳过")
@@ -723,6 +823,9 @@ def build_notion_property(name, value):
         return get_number(number) if number is not None else None
     if prop_type == "url":
         return get_url(to_text(value))
+    if prop_type == "files":
+        text = to_text(value)
+        return get_file(text) if text else None
     if prop_type in {"multi_select", "status", "select"}:
         return build_option_property(prop_type, value)
     if prop_type == "date":
@@ -738,7 +841,7 @@ def build_notion_property(name, value):
 
 def build_notion_properties(raw_properties):
     return {
-        name: prop
+        resolve_property_name(name) or name: prop
         for name, value in raw_properties.items()
         if (prop := build_notion_property(name, value)) is not None
     }
@@ -801,8 +904,6 @@ def sync():
     if books != None:
         for index, book in enumerate(books):
             sort = book["sort"]
-            if sort <= latest_sort:
-                continue
             book = book.get("book") or book
             title = book.get("title") or ""
             cover = (book.get("cover") or "").replace("/s_", "/t7_")
@@ -810,9 +911,10 @@ def sync():
             author = book.get("author") or ""
             if not bookId:
                 continue
-            categories = book.get("categories")
-            if categories != None:
-                categories = [x["title"] for x in categories]
+            categories = normalize_categories(book.get("categories") or book.get("category"))
+            existing_pages = find_existing_pages(bookId)
+            if not should_sync_book(sort, latest_sort, existing_pages, author, categories):
+                continue
             print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
             check(bookId)
             if has_any_property(("ISBN", "评分")):
