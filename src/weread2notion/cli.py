@@ -216,10 +216,10 @@ def get_read_info(bookId):
     finish_time = first_number(book.get("finishTime"), data.get("finishTime")) or 0
     update_time = first_number(book.get("updateTime"), data.get("updateTime")) or 0
     reading_time = first_number(
-        book.get("recordReadingTime"),
-        data.get("recordReadingTime"),
         book.get("readingTime"),
         data.get("readingTime"),
+        book.get("recordReadingTime"),
+        data.get("recordReadingTime"),
         book.get("totalReadingTime"),
         data.get("totalReadingTime"),
     ) or 0
@@ -671,6 +671,20 @@ def get_page_property(page, name):
     return (page.get("properties") or {}).get(actual_name)
 
 
+def get_plain_property_text(property_value):
+    if not property_value:
+        return ""
+    prop_type = property_value.get("type")
+    value = property_value.get(prop_type)
+    if prop_type in {"title", "rich_text"}:
+        return "".join(item.get("plain_text") or "" for item in value or [])
+    if prop_type in {"select", "status"} and value:
+        return value.get("name") or ""
+    if prop_type == "number" and value is not None:
+        return str(value)
+    return ""
+
+
 def property_has_value(property_value):
     if not property_value:
         return False
@@ -703,11 +717,17 @@ def should_sync_book(sort, latest_sort, existing_pages, author, categories):
         required_properties.append("分类")
 
     for name in required_properties:
-        if resolve_property_name(name) and not property_has_value(
-            get_page_property(first_page, name)
-        ):
+        if not resolve_property_name(name):
+            continue
+        property_value = get_page_property(first_page, name)
+        if not property_has_value(property_value):
             print(f"检测到已同步书籍缺少 {resolve_property_name(name)}，将重新同步")
             return True
+        if name == "阅读时长":
+            progress = to_number(get_plain_property_text(get_page_property(first_page, "阅读进度"))) or 0
+            if progress > 0 and get_plain_property_text(property_value) == "0分":
+                print(f"检测到已同步书籍阅读时长为 0分，将重新同步")
+                return True
     return False
 
 
