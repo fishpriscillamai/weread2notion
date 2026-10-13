@@ -207,10 +207,22 @@ def get_bookmark_list(bookId):
 def get_read_info(bookId):
     data = weread.request("/book/getprogress", bookId=bookId)
     book = data.get("book") or {}
-    progress = to_number(book.get("progress")) or 0
+    progress = first_number(
+        book.get("progress"),
+        data.get("progress"),
+        data.get("readingProgress"),
+    ) or 0
     reading_progress = normalize_reading_progress(progress)
-    finish_time = book.get("finishTime") or 0
-    update_time = book.get("updateTime") or 0
+    finish_time = first_number(book.get("finishTime"), data.get("finishTime")) or 0
+    update_time = first_number(book.get("updateTime"), data.get("updateTime")) or 0
+    reading_time = first_number(
+        book.get("recordReadingTime"),
+        data.get("recordReadingTime"),
+        book.get("readingTime"),
+        data.get("readingTime"),
+        book.get("totalReadingTime"),
+        data.get("totalReadingTime"),
+    ) or 0
     if finish_time or progress >= 100:
         marked_status = 4
     elif update_time or book.get("isStartReading") or progress > 0:
@@ -219,7 +231,7 @@ def get_read_info(bookId):
         marked_status = 1
     return {
         "markedStatus": marked_status,
-        "readingTime": book.get("recordReadingTime") or 0,
+        "readingTime": reading_time,
         "readingProgress": reading_progress,
         "finishedDate": finish_time,
     }
@@ -329,15 +341,8 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime", 0)
         readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
-        raw_properties["阅读时长"] = format_time
+        raw_properties["阅读时长"] = format_reading_time(readingTime)
         raw_properties["阅读进度"] = round(readingProgress * 100, 2)
         if read_info.get("finishedDate"):
             raw_properties["时间"] = read_info.get("finishedDate")
@@ -671,7 +676,9 @@ def property_has_value(property_value):
         return False
     prop_type = property_value.get("type")
     value = property_value.get(prop_type)
-    if prop_type in {"title", "rich_text", "multi_select", "files", "people", "relation"}:
+    if prop_type in {"title", "rich_text"}:
+        return any(item.get("plain_text") for item in value or [])
+    if prop_type in {"multi_select", "files", "people", "relation"}:
         return bool(value)
     if prop_type in {"select", "status", "date"}:
         return value is not None
@@ -780,6 +787,26 @@ def to_number(value):
     except (TypeError, ValueError):
         return None
     return int(number) if number.is_integer() else number
+
+
+def first_number(*values):
+    for value in values:
+        number = to_number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def format_reading_time(seconds):
+    seconds = int(to_number(seconds) or 0)
+    hours = seconds // 3600
+    minutes = seconds % 3600 // 60
+    parts = []
+    if hours:
+        parts.append(f"{hours}时")
+    if minutes:
+        parts.append(f"{minutes}分")
+    return "".join(parts) if parts else "0分"
 
 
 def normalize_date_value(value):
